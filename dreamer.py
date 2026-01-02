@@ -119,7 +119,7 @@ class Dreamer(nn.Module):
         post, context, mets = self._wm._train(data)
         metrics.update(mets)
         start = post
-        reward = lambda f, s, a: self._wm.heads["reward"](
+        reward = lambda f, s, a: self._wm.heads["rewards"](
             self._wm.dynamics.get_feat(s)
         ).mode()
         metrics.update(self._task_behavior._train(start, reward)[-1])

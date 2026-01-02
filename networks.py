@@ -306,7 +306,7 @@ class MultiEncoder(nn.Module):
         symlog_inputs,
     ):
         super(MultiEncoder, self).__init__()
-        excluded = ("is_first", "is_last", "is_terminal", "reward")
+        excluded = ("is_first", "rewards")
         shapes = {
             k: v
             for k, v in shapes.items()
@@ -348,10 +348,14 @@ class MultiEncoder(nn.Module):
     def forward(self, obs):
         outputs = []
         if self.cnn_shapes:
-            inputs = torch.cat([obs[k] for k in self.cnn_shapes], -1)
+            # inputs = torch.cat([obs[k] for k in self.cnn_shapes], -1)
+            # inputs = obs.reshape(-1, *self.cnn_shapes['observations'])
+            inputs = obs
             outputs.append(self._cnn(inputs))
         if self.mlp_shapes:
-            inputs = torch.cat([obs[k] for k in self.mlp_shapes], -1)
+            # inputs = torch.cat([obs[k] for k in self.mlp_shapes], -1)
+            # inputs = obs.reshape(-1, *self.mlp_shapes['observations'])
+            inputs = obs
             outputs.append(self._mlp(inputs))
         outputs = torch.cat(outputs, -1)
         return outputs

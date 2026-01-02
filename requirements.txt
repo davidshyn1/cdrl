@@ -12,3 +12,6 @@ crafter==1.8.0
 opencv-python==4.7.0.72
 numpy==1.23.5
 tensorboard==2.17.1
+ogbench
+labmaze #(bazel 버전 유의)
+bazel==5.4.1 #Java 11 설치 필요

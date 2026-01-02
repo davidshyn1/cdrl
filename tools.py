@@ -14,7 +14,12 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 from torch import distributions as torchd
-from torch.utils.tensorboard import SummaryWriter
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
+    print("Warning: wandb not installed. Logger will not work properly.")
 
 
 to_np = lambda x: x.detach().cpu().numpy()
@@ -31,12 +36,23 @@ def symexp(x):
 class RequiresGrad:
     def __init__(self, model):
         self._model = model
+        self._grad_enabled = None
 
     def __enter__(self):
-        self._model.requires_grad_(requires_grad=True)
+        # gradient 계산 활성화
+        self._grad_enabled = torch.is_grad_enabled()
+        torch.set_grad_enabled(True)
+        # 모든 파라미터에 requires_grad=True 설정
+        for param in self._model.parameters():
+            param.requires_grad = True
 
     def __exit__(self, *args):
-        self._model.requires_grad_(requires_grad=False)
+        # 모든 파라미터에 requires_grad=False 설정 (다른 모듈에 영향을 주지 않도록 직접 설정)
+        for param in self._model.parameters():
+            param.requires_grad = False
+        # gradient 계산 상태 복원
+        if self._grad_enabled is not None:
+            torch.set_grad_enabled(self._grad_enabled)
 
 
 class TimeRecording:
@@ -55,74 +71,120 @@ class TimeRecording:
 
 
 class Logger:
-    def __init__(self, logdir, step):
-        self._logdir = logdir
-        self._writer = SummaryWriter(log_dir=str(logdir), max_queue=1000)
-        self._last_step = None
-        self._last_time = None
+    """
+    wandb를 사용하는 Logger 클래스.
+    """
+    def __init__(self, logdir, step, project="dreamer", name=None, config=None):
+        if wandb is None:
+            raise ImportError("wandb is not installed. Please install it with: pip install wandb")
+        
+        self._logdir = pathlib.Path(logdir) if not isinstance(logdir, pathlib.Path) else logdir
+        self.step = step
         self._scalars = {}
         self._images = {}
         self._videos = {}
-        self.step = step
+        self._last_step = None
+        self._last_time = None
+        
+        # wandb 초기화
+        wandb.init(
+            project=project,
+            name=name or self._logdir.name,
+            config=config,
+            dir=str(self._logdir),
+            resume="allow",
+            id=self._logdir.name,  # 같은 logdir이면 같은 run으로 계속
+        )
+        
+        # metrics.jsonl 파일도 유지 (기존 코드와의 호환성)
+        self._metrics_file = self._logdir / "metrics.jsonl"
+        self._metrics_file.parent.mkdir(parents=True, exist_ok=True)
 
     def scalar(self, name, value):
+        """Scalar 값을 기록합니다."""
         self._scalars[name] = float(value)
 
     def image(self, name, value):
+        """이미지를 기록합니다."""
         self._images[name] = np.array(value)
 
     def video(self, name, value):
+        """비디오를 기록합니다."""
         self._videos[name] = np.array(value)
 
     def write(self, fps=False, step=False):
+        """wandb에 로그를 기록합니다."""
         if not step:
             step = self.step
+        
         scalars = list(self._scalars.items())
         if fps:
-            scalars.append(("fps", self._compute_fps(step)))
+            fps_value = self._compute_fps(step)
+            scalars.append(("fps", fps_value))
+        
+        # 콘솔 출력
         print(f"[{step}]", " / ".join(f"{k} {v:.1f}" for k, v in scalars))
-        with (self._logdir / "metrics.jsonl").open("a") as f:
+        
+        # metrics.jsonl 파일에 기록 (기존 코드와의 호환성)
+        with self._metrics_file.open("a") as f:
             f.write(json.dumps({"step": step, **dict(scalars)}) + "\n")
+        
+        # wandb에 기록
+        log_dict = {}
         for name, value in scalars:
-            if "/" not in name:
-                self._writer.add_scalar("scalars/" + name, value, step)
-            else:
-                self._writer.add_scalar(name, value, step)
+            log_dict[name] = value
+        
+        # 이미지 기록
         for name, value in self._images.items():
-            self._writer.add_image(name, value, step)
+            # wandb는 numpy array를 직접 받을 수 있음
+            if value.ndim == 3:  # (H, W, C)
+                log_dict[name] = wandb.Image(value)
+            elif value.ndim == 4:  # (B, H, W, C)
+                log_dict[name] = [wandb.Image(img) for img in value]
+        
+        # 비디오 기록
         for name, value in self._videos.items():
             name = name if isinstance(name, str) else name.decode("utf-8")
             if np.issubdtype(value.dtype, np.floating):
                 value = np.clip(255 * value, 0, 255).astype(np.uint8)
-            B, T, H, W, C = value.shape
-            value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
-            self._writer.add_video(name, value, step, 16)
-
-        self._writer.flush()
+            # wandb.Video는 (B, T, C, H, W) 형태를 기대
+            if value.ndim == 5:  # (B, T, H, W, C)
+                value = np.transpose(value, (0, 1, 4, 2, 3))  # (B, T, C, H, W)
+            log_dict[name] = wandb.Video(value, fps=16, format="mp4")
+        
+        # wandb에 로그 기록
+        wandb.log(log_dict, step=step)
+        
+        # 버퍼 클리어
         self._scalars = {}
         self._images = {}
         self._videos = {}
 
     def _compute_fps(self, step):
+        """FPS를 계산합니다."""
         if self._last_step is None:
             self._last_time = time.time()
             self._last_step = step
-            return 0
+            return 0.0
+        
+        current_time = time.time()
+        elapsed = current_time - self._last_time
         steps = step - self._last_step
-        duration = time.time() - self._last_time
-        self._last_time += duration
+        
+        if elapsed > 0:
+            fps = steps / elapsed
+        else:
+            fps = 0.0
+        
         self._last_step = step
-        return steps / duration
-
-    def offline_scalar(self, name, value, step):
-        self._writer.add_scalar("scalars/" + name, value, step)
-
-    def offline_video(self, name, value, step):
-        if np.issubdtype(value.dtype, np.floating):
-            value = np.clip(255 * value, 0, 255).astype(np.uint8)
-        B, T, H, W, C = value.shape
-        value = value.transpose(1, 4, 2, 0, 3).reshape((1, T, C, H, B * W))
-        self._writer.add_video(name, value, step, 16)
+        self._last_time = current_time
+        
+        return fps
+    
+    def finish(self):
+        """wandb run을 종료합니다."""
+        if wandb is not None:
+            wandb.finish()
 
 
 def simulate(
@@ -307,6 +369,16 @@ def save_episodes(directory, episodes):
 
 
 def from_generator(generator, batch_size):
+    """
+    샘플링된 episode 데이터를 batch_size만큼 묶어서 반환합니다.
+    
+    Args:
+        generator: 샘플링된 episode 데이터 generator
+        batch_size: 배치 크기
+    
+    Yields:
+        배치 크기만큼 묶인 episode 데이터
+    """
     while True:
         batch = []
         for _ in range(batch_size):
@@ -321,10 +393,27 @@ def from_generator(generator, batch_size):
 
 
 def sample_episodes(episodes, length, seed=0):
+    """
+    각 task별 episodes에서 batch_length만큼 샘플링합니다.
+    
+    Args:
+        episodes: 각 task별 episodes dictionary
+                 예: {'episode_0': {'observations': ..., 'actions': ...}, 
+                      'episode_1': {...}, ...}
+        length: 샘플링할 길이 (batch_length)
+        seed: 랜덤 시드
+    
+    Yields:
+        샘플링된 episode 데이터 (batch_length 길이)
+    """
     np_random = np.random.RandomState(seed)
     while True:
         size = 0
         ret = None
+        if not episodes:
+            raise ValueError("episodes dictionary is empty, cannot sample episodes")
+        
+        # 각 episode의 길이를 기반으로 샘플링 확률 계산
         p = np.array(
             [len(next(iter(episode.values()))) for episode in episodes.values()]
         )
@@ -336,9 +425,18 @@ def sample_episodes(episodes, length, seed=0):
             if total < 2:
                 continue
             if not ret:
-                index = int(np_random.randint(0, total - 1))
+                # episode length가 batch_length보다 크면, episode에서 batch_length만큼만 샘플링
+                if total > length:
+                    # 랜덤 시작점 선택 (total - length + 1까지 가능)
+                    max_start = max(0, total - length)
+                    index = int(np_random.randint(0, max_start + 1))
+                    end_index = index + length
+                else:
+                    # episode length가 batch_length보다 작거나 같으면 전체 episode 사용
+                    index = 0
+                    end_index = total
                 ret = {
-                    k: v[index : min(index + length, total)].copy()
+                    k: v[index : end_index].copy()
                     for k, v in episode.items()
                     if "log_" not in k
                 }
@@ -348,9 +446,17 @@ def sample_episodes(episodes, length, seed=0):
                 # 'is_first' comes after 'is_last'
                 index = 0
                 possible = length - size
+                # episode length가 남은 길이보다 크면, episode에서 남은 길이만큼만 샘플링
+                if total > possible:
+                    max_start = max(0, total - possible)
+                    start_idx = int(np_random.randint(0, max_start + 1))
+                    end_idx = start_idx + possible
+                else:
+                    start_idx = 0
+                    end_idx = total
                 ret = {
                     k: np.append(
-                        ret[k], v[index : min(index + possible, total)].copy(), axis=0
+                        ret[k], v[start_idx : end_idx].copy(), axis=0
                     )
                     for k, v in episode.items()
                     if "log_" not in k
@@ -611,10 +717,11 @@ class Bernoulli:
 
     def log_prob(self, x):
         _logits = self._dist.base_dist.logits
-        log_probs0 = -F.softplus(_logits)
-        log_probs1 = -F.softplus(-_logits)
+        log_probs0 = -F.softplus(_logits).squeeze(2)
+        log_probs1 = -F.softplus(-_logits).squeeze(2)
 
-        return torch.sum(log_probs0 * (1 - x) + log_probs1 * x, -1)
+        # return torch.sum(log_probs0 * (1 - x) + log_probs1 * x, -1)
+        return log_probs0 * (1 - x) + log_probs1 * x
 
 
 class UnnormalizedHuber(torchd.normal.Normal):
@@ -728,7 +835,7 @@ class Optimizer:
         wd=None,
         wd_pattern=r".*",
         opt="adam",
-        use_amp=False,
+        use_amp=True,
     ):
         assert 0 <= wd < 1
         assert not clip or 1 <= clip
@@ -744,22 +851,61 @@ class Optimizer:
             "sgd": lambda: torch.optim.SGD(parameters, lr=lr),
             "momentum": lambda: torch.optim.SGD(parameters, lr=lr, momentum=0.9),
         }[opt]()
-        self._scaler = torch.cuda.amp.GradScaler(enabled=use_amp)
+        self._scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
+        self._use_amp = use_amp
 
     def __call__(self, loss, params, retain_graph=True):
         assert len(loss.shape) == 0, loss.shape
         metrics = {}
         metrics[f"{self._name}_loss"] = loss.detach().cpu().numpy()
+        
+        # 디버깅: loss의 requires_grad 확인
+        if not loss.requires_grad:
+            print(f"WARNING [{self._name}]: loss.requires_grad = {loss.requires_grad}")
+            print(f"  loss value: {loss.item()}")
+            print(f"  loss.grad_fn: {loss.grad_fn}")
+            # 파라미터들의 requires_grad 확인
+            param_count = 0
+            requires_grad_count = 0
+            for param in params:
+                param_count += 1
+                if param.requires_grad:
+                    requires_grad_count += 1
+            print(f"  params with requires_grad: {requires_grad_count}/{param_count}")
+            if requires_grad_count == 0:
+                print(f"  ERROR: No parameters have requires_grad=True!")
+        
         self._opt.zero_grad()
-        self._scaler.scale(loss).backward(retain_graph=retain_graph)
-        self._scaler.unscale_(self._opt)
-        # loss.backward(retain_graph=retain_graph)
-        norm = torch.nn.utils.clip_grad_norm_(params, self._clip)
-        if self._wd:
-            self._apply_weight_decay(params)
-        self._scaler.step(self._opt)
-        self._scaler.update()
-        # self._opt.step()
+        
+        if self._use_amp:
+            # AMP 사용 시: scaler를 통해 backward
+            scaled_loss = self._scaler.scale(loss)
+            scaled_loss.backward(retain_graph=retain_graph)
+            
+            # 디버깅: backward 후 gradient 확인
+            grad_count = 0
+            for param in params:
+                if param.grad is not None:
+                    grad_count += 1
+            
+            # unscale_()를 호출하여 gradient를 unscaling하고 inf 체크 수행
+            self._scaler.unscale_(self._opt)
+            # gradient clipping (unscale된 gradient에 대해)
+            norm = torch.nn.utils.clip_grad_norm_(params, self._clip)
+            if self._wd:
+                self._apply_weight_decay(params)
+            # scaler.step()은 내부적으로 unscale_()를 다시 호출할 수 있지만,
+            # 이미 unscale_()를 호출했으므로 정상적으로 작동해야 함
+            self._scaler.step(self._opt)
+            self._scaler.update()
+        else:
+            # AMP 미사용 시: 일반 backward (scaler 사용 안 함)
+            loss.backward(retain_graph=retain_graph)
+            norm = torch.nn.utils.clip_grad_norm_(params, self._clip)
+            if self._wd:
+                self._apply_weight_decay(params)
+            self._opt.step()
+        
         self._opt.zero_grad()
         metrics[f"{self._name}_grad_norm"] = to_np(norm)
         return metrics

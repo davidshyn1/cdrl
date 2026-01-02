@@ -13,9 +13,9 @@ defaults:
   eval_episode_num: 10
   log_every: 1e4
   reset_every: 0
-  device: 'cuda:0'
+  device: 'cuda:1'
   compile: True
-  precision: 32
+  precision: 16
   debug: False
   video_pred_log: True
 

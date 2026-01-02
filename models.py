@@ -32,9 +32,47 @@ class WorldModel(nn.Module):
         self._step = step
         self._use_amp = True if config.precision == 16 else False
         self._config = config
-        shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
+        
+        # obs_space가 Dict space인지 확인하고 shapes 추출
+        import gym.spaces as spaces
+        
+        try:
+            # 1. Dict space인 경우
+            if isinstance(obs_space, spaces.Dict):
+                shapes = {k: tuple(v.shape) for k, v in obs_space.spaces.items()}
+            # 2. Box space인 경우
+            elif isinstance(obs_space, spaces.Box):
+                shapes = {'observations': tuple(obs_space.shape)}
+            # 3. spaces 속성이 있는 경우 (Dict-like)
+            elif hasattr(obs_space, 'spaces'):
+                spaces_dict = obs_space.spaces
+                # spaces가 속성인지 메서드인지 확인
+                if callable(spaces_dict):
+                    spaces_dict = spaces_dict()
+                # dict-like 객체에서 shapes 추출
+                if hasattr(spaces_dict, 'items'):
+                    shapes = {k: tuple(v.shape) if hasattr(v, 'shape') else tuple(v) 
+                             for k, v in spaces_dict.items()}
+                else:
+                    raise ValueError(f"obs_space.spaces is not dict-like: {type(spaces_dict)}")
+            # 4. shape 속성이 직접 있는 경우
+            elif hasattr(obs_space, 'shape'):
+                shapes = {'observations': tuple(obs_space.shape)}
+            else:
+                # 지원하지 않는 타입
+                raise ValueError(f"Unsupported observation space type: {type(obs_space)}")
+        except ValueError:
+            # ValueError는 그대로 전파
+            raise
+        except Exception as e:
+            # 기타 예외는 상세 정보와 함께 전파
+            raise ValueError(
+                f"Error extracting shapes from observation space (type: {type(obs_space)}): {str(e)}"
+            ) from e
+        ### Observation Encoder q(x_t|o_t)
         self.encoder = networks.MultiEncoder(shapes, **config.encoder)
         self.embed_size = self.encoder.outdim
+        ### Dynamics Model q(s_t|s_{t-1}, a_{t-1})
         self.dynamics = networks.RSSM(
             config.dyn_stoch,
             config.dyn_deter,
@@ -53,14 +91,16 @@ class WorldModel(nn.Module):
             config.device,
         )
         self.heads = nn.ModuleDict()
-        if config.dyn_discrete:
+        if config.dyn_discrete: # if the dynamics model is discrete
             feat_size = config.dyn_stoch * config.dyn_discrete + config.dyn_deter
         else:
             feat_size = config.dyn_stoch + config.dyn_deter
+        ### Decoder p(o_t|s_t)
         self.heads["decoder"] = networks.MultiDecoder(
             feat_size, shapes, **config.decoder
         )
-        self.heads["reward"] = networks.MLP(
+        ### Reward Head p(r_t|s_t,a_t)
+        self.heads["rewards"] = networks.MLP(
             feat_size,
             (255,) if config.reward_head["dist"] == "symlog_disc" else (),
             config.reward_head["layers"],
@@ -101,29 +141,47 @@ class WorldModel(nn.Module):
         )
         # other losses are scaled by 1.0.
         self._scales = dict(
-            reward=config.reward_head["loss_scale"],
+            rewards=config.reward_head["loss_scale"],
             cont=config.cont_head["loss_scale"],
         )
 
-    def _train(self, data):
+    def _train(self, data, eval_mode=False):
         # action (batch_size, batch_length, act_dim)
-        # image (batch_size, batch_length, h, w, ch)
+        # observations (batch_size, batch_length, h, w, ch)
         # reward (batch_size, batch_length)
-        # discount (batch_size, batch_length)
         data = self.preprocess(data)
 
-        with tools.RequiresGrad(self):
-            with torch.cuda.amp.autocast(self._use_amp):
-                embed = self.encoder(data)
+        if not eval_mode:
+            # 명시적으로 모든 서브모듈을 train 모드로 설정
+            self.train(True)
+            self.encoder.train(True)
+            self.dynamics.train(True)
+            for head in self.heads.values():
+                head.train(True)
+        else:
+            self.eval()
+            self.encoder.eval()
+            self.dynamics.eval()
+            for head in self.heads.values():
+                head.eval()
+
+        with tools.RequiresGrad(self):         
+            with torch.amp.autocast('cuda:1', enabled=self._use_amp):
+                # encoder 실행
+                embed = self.encoder(data["observations"])
+                
+
                 post, prior = self.dynamics.observe(
-                    embed, data["action"], data["is_first"]
+                    embed, data["actions"], data["is_first"]
                 )
+
                 kl_free = self._config.kl_free
                 dyn_scale = self._config.dyn_scale
                 rep_scale = self._config.rep_scale
                 kl_loss, kl_value, dyn_loss, rep_loss = self.dynamics.kl_loss(
                     post, prior, kl_free, dyn_scale, rep_scale
                 )
+
                 assert kl_loss.shape == embed.shape[:2], kl_loss.shape
                 preds = {}
                 for name, head in self.heads.items():
@@ -145,7 +203,12 @@ class WorldModel(nn.Module):
                     for key, value in losses.items()
                 }
                 model_loss = sum(scaled.values()) + kl_loss
-            metrics = self._model_opt(torch.mean(model_loss), self.parameters())
+                
+                # torch.mean을 autocast 블록 안에서 호출하여 gradient 유지
+                mean_loss = torch.mean(model_loss)
+                
+                # optimizer 호출도 autocast 블록 안에서 수행 (gradient 그래프 유지)
+                metrics = self._model_opt(mean_loss, self.parameters())
 
         metrics.update({f"{name}_loss": to_np(loss) for name, loss in losses.items()})
         metrics["kl_free"] = kl_free
@@ -154,7 +217,7 @@ class WorldModel(nn.Module):
         metrics["dyn_loss"] = to_np(dyn_loss)
         metrics["rep_loss"] = to_np(rep_loss)
         metrics["kl"] = to_np(torch.mean(kl_value))
-        with torch.cuda.amp.autocast(self._use_amp):
+        with torch.amp.autocast('cuda:1', enabled=self._use_amp):
             metrics["prior_ent"] = to_np(
                 torch.mean(self.dynamics.get_dist(prior).entropy())
             )
@@ -172,44 +235,68 @@ class WorldModel(nn.Module):
 
     # this function is called during both rollout and training
     def preprocess(self, obs):
-        obs = {
-            k: torch.tensor(v, device=self._config.device, dtype=torch.float32)
-            for k, v in obs.items()
-        }
-        obs["image"] = obs["image"] / 255.0
-        if "discount" in obs:
-            obs["discount"] *= self._config.discount
+        # torch.tensor()는 새로운 텐서를 생성하므로 gradient를 끊을 수 있음
+        # 이미 텐서인 경우 .to()를 사용하고, numpy array인 경우만 torch.tensor() 사용
+        processed_obs = {}
+        for k, v in obs.items():
+            if isinstance(v, torch.Tensor):
+                # 이미 텐서인 경우 device와 dtype만 변경 (gradient 유지)
+                processed_obs[k] = v.to(device=self._config.device, dtype=torch.float32)
+            else:
+                # numpy array 등인 경우 새 텐서 생성 (입력 데이터이므로 gradient 불필요)
+                processed_obs[k] = torch.tensor(v, device=self._config.device, dtype=torch.float32)
+        obs = processed_obs
+        obs["observations"] = obs["observations"] / 255.0
+        if "discounts" in obs:
+            obs["discounts"] *= self._config.discount
             # (batch_size, batch_length) -> (batch_size, batch_length, 1)
-            obs["discount"] = obs["discount"].unsqueeze(-1)
-        # 'is_first' is necesarry to initialize hidden state at training
-        assert "is_first" in obs
-        # 'is_terminal' is necesarry to train cont_head
-        assert "is_terminal" in obs
-        obs["cont"] = (1.0 - obs["is_terminal"]).unsqueeze(-1)
+            obs["discounts"] = obs["discounts"] #.unsqueeze(-1)
+        obs["cont"] = (1.0 - obs["terminals"]) #.unsqueeze(-1)
+        
+        # is_first 처리: 없으면 생성, 있으면 shape 확인 후 변환
+        if "is_first" not in obs:
+            batch_size, batch_length = obs["observations"].shape[:2]
+            is_first = torch.zeros((batch_size, batch_length), device=self._config.device, dtype=torch.float32)
+            is_first[:, 0] = 1.0  # 각 batch의 첫 번째 step만 True
+            obs["is_first"] = is_first
+        else:
+            # is_first가 있으면 float32로 변환하고 shape 확인
+            is_first = obs["is_first"].float()
+            # shape가 (batch_size, batch_length)가 아니면 reshape
+            if is_first.ndim == 1:
+                # 1D인 경우 (batch_size * batch_length,) -> (batch_size, batch_length)로 reshape
+                batch_size, batch_length = obs["observations"].shape[:2]
+                is_first = is_first.view(batch_size, batch_length)
+            elif is_first.ndim > 2:
+                # 3D 이상인 경우 마지막 차원 제거
+                is_first = is_first.squeeze(-1)
+            obs["is_first"] = is_first
+        
         return obs
 
-    def video_pred(self, data):
-        data = self.preprocess(data)
-        embed = self.encoder(data)
+    # ##TODO : Check this function when video prediction is implemented
+    # def video_pred(self, data):
+    #     data = self.preprocess(data)
+    #     embed = self.encoder(data)
 
-        states, _ = self.dynamics.observe(
-            embed[:6, :5], data["action"][:6, :5], data["is_first"][:6, :5]
-        )
-        recon = self.heads["decoder"](self.dynamics.get_feat(states))["image"].mode()[
-            :6
-        ]
-        reward_post = self.heads["reward"](self.dynamics.get_feat(states)).mode()[:6]
-        init = {k: v[:, -1] for k, v in states.items()}
-        prior = self.dynamics.imagine_with_action(data["action"][:6, 5:], init)
-        openl = self.heads["decoder"](self.dynamics.get_feat(prior))["image"].mode()
-        reward_prior = self.heads["reward"](self.dynamics.get_feat(prior)).mode()
-        # observed image is given until 5 steps
-        model = torch.cat([recon[:, :5], openl], 1)
-        truth = data["image"][:6]
-        model = model
-        error = (model - truth + 1.0) / 2.0
+    #     states, _ = self.dynamics.observe(
+    #         embed[:6, :5], data["s"][:6, :5], data["is_first"][:6, :5]
+    #     )
+    #     recon = self.heads["decoder"](self.dynamics.get_feat(states))["observations"].mode()[
+    #         :6
+    #     ]
+    #     reward_post = self.heads["rewards"](self.dynamics.get_feat(states)).mode()[:6]
+    #     init = {k: v[:, -1] for k, v in states.items()}
+    #     prior = self.dynamics.imagine_with_action(data["actions"][:6, 5:], init)
+    #     openl = self.heads["decoder"](self.dynamics.get_feat(prior))["observations"].mode()
+    #     reward_prior = self.heads["rewards"](self.dynamics.get_feat(prior)).mode()
+    #     # observed image is given until 5 steps
+    #     model = torch.cat([recon[:, :5], openl], 1)
+    #     truth = data["observations"][:6]
+    #     model = model
+    #     error = (model - truth + 1.0) / 2.0
 
-        return torch.cat([truth, model, error], 2)
+    #     return torch.cat([truth, model, error], 2)
 
 
 class ImagBehavior(nn.Module):
@@ -292,8 +379,13 @@ class ImagBehavior(nn.Module):
         self._update_slow_target()
         metrics = {}
 
+
+        # # 모든 파라미터에 requires_grad=True 명시적으로 설정
+        # for param in self.actor.parameters():
+        #     param.requires_grad = True
+
         with tools.RequiresGrad(self.actor):
-            with torch.cuda.amp.autocast(self._use_amp):
+            with torch.amp.autocast('cuda:1', enabled=self._use_amp):
                 imag_feat, imag_state, imag_action = self._imagine(
                     start, self.actor, self._config.imag_horizon
                 )
@@ -316,8 +408,15 @@ class ImagBehavior(nn.Module):
                 metrics.update(mets)
                 value_input = imag_feat
 
+        # actor 컨텍스트가 끝난 후 value 파라미터가 여전히 requires_grad=True인지 확인
+        # # 모든 파라미터에 requires_grad=True 명시적으로 설정 (actor 컨텍스트의 영향 제거)
+        # for param in self.value.parameters():
+        #     if not param.requires_grad:
+        #         print(f"WARNING: value param requires_grad=False before RequiresGrad context, fixing...")
+        #     param.requires_grad = True
+
         with tools.RequiresGrad(self.value):
-            with torch.cuda.amp.autocast(self._use_amp):
+            with torch.amp.autocast('cuda:1', enabled=self._use_amp):
                 value = self.value(value_input[:-1].detach())
                 target = torch.stack(target, dim=1)
                 # (time, batch, 1), (time, batch, 1) -> (time, batch)
